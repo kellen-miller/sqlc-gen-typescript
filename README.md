@@ -13,6 +13,16 @@ expressions and date affinities remain `unknown`. Integer row types assume the
 driver's default numeric mode. SQLite output now uses actual column names and
 alias casing, including quoted aliases, rather than camel-casing returned keys.
 
+Use the fork's checksum-pinned WASM release in sqlc's plugin configuration:
+
+```yaml
+plugins:
+  - name: ts
+    wasm:
+      url: https://github.com/kellen-miller/sqlc-gen-typescript/releases/download/v0.1.4-chief.1/sqlc-gen-typescript_0.1.4-chief.1.wasm
+      sha256: 685124bdee17518a6ee95dd9107a6d95c3be2990a465a1f1a1e9a37911240e57
+```
+
 Set `sqlite.emit: prepared` to receive typed statements instead of execution
 functions. This preserves synchronous transaction ownership and the driver's
 `get`, `all`, `run`, and scalar `pluck` APIs. Anonymous positional bindings use

@@ -1,4 +1,5 @@
 import {
+  EmitHint,
   createPrinter,
   createSourceFile,
   NewLineKind,
@@ -277,9 +278,13 @@ export function generateSqlite(
       ScriptTarget.Latest,
       true,
     );
-    const formatted = createPrinter({
-      newLine: NewLineKind.LineFeed,
-    }).printFile(source);
+    const printer = createPrinter({ newLine: NewLineKind.LineFeed });
+    const formatted =
+      source.statements
+        .map((statement) =>
+          printer.printNode(EmitHint.Unspecified, statement, source),
+        )
+        .join("\n\n") + "\n";
     files.push(
       new File({
         name: filename,
