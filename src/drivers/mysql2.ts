@@ -3,7 +3,7 @@ import { SyntaxKind, NodeFlags, TypeNode, factory } from "typescript";
 // import { writeFileSync, STDIO } from "javy/fs";
 
 import { Parameter, Column, Query } from "../gen/plugin/codegen_pb";
-import { argName, colName } from "./utlis";
+import { argName, colName } from "./field-names";
 
 export interface Mysql2Options {
   support_big_numbers?: boolean;

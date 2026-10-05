@@ -2,4 +2,7 @@ node_modules
 out.js
 *.wasm
 javy
-tests
+
+out-node.cjs
+out-test.cjs
+.sqlite-test-*

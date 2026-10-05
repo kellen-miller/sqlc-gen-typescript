@@ -4,7 +4,7 @@ import { Column } from "../gen/plugin/codegen_pb";
 export function fieldName(
   prefix: string,
   index: number,
-  column?: Column
+  column?: Column,
 ): string {
   let name = `${prefix}_${index}`;
   if (column) {

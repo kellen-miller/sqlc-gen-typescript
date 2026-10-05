@@ -1,24 +1,29 @@
 name: ci
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   pull_request:
+permissions:
+  contents: read
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-    - uses: sqlc-dev/setup-sqlc@v4
-      with:
-        sqlc-version: '1.24.0'
-    - uses: actions/setup-node@v4
-    - run: wget https://github.com/bytecodealliance/javy/releases/download/v1.2.0/javy-x86_64-linux-v1.2.0.gz
-    - run: gzip -d javy-x86_64-linux-v1.2.0.gz
-    - run: chmod +x javy-x86_64-linux-v1.2.0
-    - run: npm install
-    - run: npx tsc --noEmit
-    - run: npx esbuild --bundle src/app.ts --tree-shaking=true --format=esm --target=es2020 --outfile=out.js
-    - run: ./javy-x86_64-linux-v1.2.0 compile out.js -o examples/plugin.wasm
-    - run: sqlc -f sqlc.dev.yaml diff
-      working-directory: examples
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: sqlc-dev/setup-sqlc@7247af29a59647b720868511024240c31dd7c411
+        with:
+          sqlc-version: "1.31.1"
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: "24"
+          cache: npm
+      - name: Install pinned Javy compiler
+        run: |
+          curl -fsSL https://github.com/bytecodealliance/javy/releases/download/v1.2.0/javy-x86_64-linux-v1.2.0.gz -o javy.gz
+          echo '35b70c84a892f848fc57471cb05b53fc95f518d8cbb966eca5aa1c84a0b01a31  javy.gz' | sha256sum -c -
+          gzip -d javy.gz
+          chmod +x javy
+      - run: npm ci
+      - run: make test
+      - run: sqlc -f sqlc.dev.yaml diff
+        working-directory: examples

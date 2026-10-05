@@ -7,7 +7,7 @@ import {
 } from "typescript";
 
 import { Parameter, Column } from "../gen/plugin/codegen_pb";
-import { argName, colName } from "./utlis";
+import { argName, colName } from "./field-names";
 import { log } from "../logger";
 
 function funcParamsDecl(iface: string | undefined, params: Parameter[]) {

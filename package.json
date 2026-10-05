@@ -4,17 +4,25 @@
   "description": "",
   "main": "app.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "build": "tsc --noEmit && esbuild --bundle src/app.ts --tree-shaking=true --format=esm --target=es2020 --outfile=out.js && esbuild --bundle src/node-app.ts --platform=node --outfile=out-node.cjs",
+    "test": "esbuild test/generator.test.ts --bundle --platform=node --packages=external --outfile=out-test.cjs && node --test out-test.cjs"
   },
   "author": "",
   "license": "ISC",
   "devDependencies": {
     "esbuild": "^0.19.5",
-    "typescript": "^5.2.2"
+    "typescript": "^5.2.2",
+    "@types/node": "24.10.4",
+    "better-sqlite3": "12.11.1",
+    "@types/better-sqlite3": "7.6.13"
   },
   "dependencies": {
     "@bufbuild/protobuf": "^1.4.2",
     "javy": "^0.1.2",
     "pg": "^8.11.3"
+  },
+  "allowScripts": {
+    "esbuild@0.19.5": true,
+    "better-sqlite3@12.11.1": true
   }
 }
