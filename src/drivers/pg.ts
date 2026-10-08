@@ -8,7 +8,7 @@ import {
 } from "typescript";
 
 import { Parameter, Column, Query } from "../gen/plugin/codegen_pb";
-import { argName, colName } from "./utlis";
+import { argName, colName } from "./field-names";
 
 function funcParamsDecl(iface: string | undefined, params: Parameter[]) {
   let funcParams = [

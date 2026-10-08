@@ -1,438 +1,297 @@
 import {
-  SyntaxKind,
-  NodeFlags,
-  Node,
-  TypeNode,
-  factory,
-  FunctionDeclaration,
+  EmitHint,
+  createPrinter,
+  createSourceFile,
+  NewLineKind,
+  ScriptTarget,
 } from "typescript";
+import {
+  Column,
+  File,
+  GenerateRequest,
+  GenerateResponse,
+} from "../gen/plugin/codegen_pb";
 
-import { Parameter, Column, Query } from "../gen/plugin/codegen_pb";
-import { argName } from "./utlis";
-
-function funcParamsDecl(iface: string | undefined, params: Parameter[]) {
-  let funcParams = [
-    factory.createParameterDeclaration(
-      undefined,
-      undefined,
-      factory.createIdentifier("database"),
-      undefined,
-      factory.createTypeReferenceNode(
-        factory.createIdentifier("Database"),
-        undefined
-      ),
-      undefined
-    ),
-  ];
-
-  if (iface && params.length > 0) {
-    funcParams.push(
-      factory.createParameterDeclaration(
-        undefined,
-        undefined,
-        factory.createIdentifier("args"),
-        undefined,
-        factory.createTypeReferenceNode(
-          factory.createIdentifier(iface),
-          undefined
-        ),
-        undefined
-      )
-    );
-  }
-
-  return funcParams;
+export interface SqliteOptions {
+  sqlite?: {
+    emit?: "functions" | "prepared";
+    filename?: string;
+    parameter_types?: Record<string, Record<string, string>>;
+  };
 }
 
-export class Driver {
-  /**
-   * {@link https://github.com/WiseLibs/better-sqlite3/blob/v9.4.1/docs/api.md#binding-parameters}
-   * {@link https://github.com/sqlc-dev/sqlc/blob/v1.25.0/internal/codegen/golang/sqlite_type.go}
-   */
-  columnType(column?: Column): TypeNode {
-    if (column === undefined || column.type === undefined) {
-      return factory.createKeywordTypeNode(SyntaxKind.AnyKeyword);
+// SQLite returns numbers for booleans and does not convert dates into JS Date.
+// Unknown expressions/affinities remain unknown rather than weakening to any.
+function columnType(column?: Column): string {
+  const name = (column?.type?.name ?? "")
+    .toLowerCase()
+    .replace(/\s+/g, "")
+    .replace(/\(.*/, "");
+  let type = "unknown";
+  if (
+    /^(int|integer|tinyint|smallint|mediumint|bigint|unsignedbigint|int2|int8|real|double|doubleprecision|float|numeric|decimal|boolean|bool)$/.test(
+      name,
+    )
+  ) {
+    type = "number";
+  } else if (/^(text|varchar|nvarchar|char|nchar|clob)$/.test(name)) {
+    type = "string";
+  } else if (name === "blob") {
+    type = "Buffer";
+  }
+
+  return column?.notNull || type === "unknown" ? type : `${type} | null`;
+}
+
+// Tokenize SQL so aliases/bindings inside literals and comments stay untouched.
+// Retain trivia for byte-for-byte query reconstruction apart from bind markers.
+function sqlTokens(text: string): string[] {
+  return (
+    text.match(
+      /'(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|\[[^\]]*\]|--[^\r\n]*|\/\*[\s\S]*?\*\/|\?\d*|[A-Za-z_][A-Za-z0-9_]*|\s+|./g,
+    ) ?? []
+  );
+}
+
+export function generateSqlite(
+  input: GenerateRequest,
+  options: SqliteOptions,
+): GenerateResponse {
+  const sqlite = options.sqlite ?? {};
+  const emit = sqlite.emit ?? "functions";
+  if (emit !== "functions" && emit !== "prepared") {
+    throw new Error(`unknown SQLite emit mode: ${emit}`);
+  }
+
+  if (
+    sqlite.filename &&
+    !/^[A-Za-z][A-Za-z0-9_-]*\.ts$/.test(sqlite.filename)
+  ) {
+    throw new Error("SQLite filename must be a simple .ts filename");
+  }
+
+  const overrides = sqlite.parameter_types ?? {};
+  for (const [name, parameters] of Object.entries(overrides)) {
+    const query = input.queries.find((query) => query.name === name);
+    if (!query) {
+      throw new Error(`parameter override references unknown query: ${name}`);
     }
 
-    let typ: TypeNode = factory.createKeywordTypeNode(SyntaxKind.AnyKeyword);
-    switch (column.type.name) {
-      case "int":
-      case "integer":
-      case "tinyint":
-      case "smallint":
-      case "mediumint":
-      case "bigint":
-      case "unsignedbigint":
-      case "int2":
-      case "int8": {
-        // TODO: Improve `BigInt` handling (https://github.com/WiseLibs/better-sqlite3/blob/v9.4.1/docs/integer.md)
-        typ = factory.createKeywordTypeNode(SyntaxKind.NumberKeyword);
-        break;
-      }
-      case "blob": {
-        // TODO: Is this correct or node-specific?
-        typ = factory.createTypeReferenceNode(
-          factory.createIdentifier("Buffer"),
-          undefined
+    for (const [number, type] of Object.entries(parameters)) {
+      if (
+        !query.params.some((parameter) => String(parameter.number) === number)
+      ) {
+        throw new Error(
+          `parameter override references unknown parameter: ${name}.${number}`,
         );
-        break;
       }
-      case "real":
-      case "double":
-      case "doubleprecision":
-      case "float": {
-        typ = factory.createKeywordTypeNode(SyntaxKind.NumberKeyword);
-        break;
+
+      if (!/^(number|string|Buffer|unknown)( \| null)?$/.test(type)) {
+        throw new Error(`invalid SQLite parameter type: ${type}`);
       }
-      case "boolean":
-      case "bool": {
-        typ = factory.createKeywordTypeNode(SyntaxKind.BooleanKeyword);
-        break;
+    }
+  }
+
+  const groups = new Map<string, typeof input.queries>();
+  for (const query of input.queries) {
+    const filename =
+      sqlite.filename ?? query.filename.replace(/\./g, "_") + ".ts";
+    const queries = groups.get(filename) ?? [];
+    queries.push(query);
+    groups.set(filename, queries);
+  }
+
+  const files: File[] = [];
+  for (const [filename, queries] of groups) {
+    let output =
+      "// Code generated by sqlc-gen-typescript. DO NOT EDIT.\nimport type Database from 'better-sqlite3';\n\n";
+    if (emit === "prepared") {
+      output +=
+        "// Preserve scalar result types when pluck() is enabled.\ntype PreparedStatement<P extends unknown[], R, S> = Omit<Database.Statement<P, R>, 'pluck'> & { pluck(): Database.Statement<P, S> };\n\n";
+    }
+
+    const names = new Set<string>();
+    for (const query of queries) {
+      if (!/^[A-Za-z][A-Za-z0-9_]*$/.test(query.name)) {
+        throw new Error(`invalid SQLite query name: ${query.name}`);
       }
-      case "date":
-      case "datetime":
-      case "timestamp": {
-        typ = factory.createTypeReferenceNode(
-          factory.createIdentifier("Date"),
-          undefined
+
+      if (
+        ![":exec", ":execrows", ":execlastid", ":one", ":many"].includes(
+          query.cmd,
+        )
+      ) {
+        throw new Error(`unsupported SQLite command: ${query.cmd}`);
+      }
+
+      const name = query.name[0].toLowerCase() + query.name.slice(1);
+      if (names.has(name)) {
+        throw new Error(`duplicate SQLite function name: ${name}`);
+      }
+
+      names.add(name);
+      const prefix = query.name[0].toUpperCase() + query.name.slice(1);
+      const row = `${prefix}Row`;
+      const args = `${prefix}Args`;
+      const params = [...query.params].sort((a, b) => a.number - b.number);
+      const paramTypes = params.map(
+        (param) =>
+          overrides[query.name]?.[String(param.number)] ??
+          columnType(param.column),
+      );
+      const named =
+        params.length > 0 &&
+        params.every((param) => param.column?.isNamedParam);
+      if (!named && params.some((param) => param.column?.isNamedParam)) {
+        throw new Error(
+          `mixed named/positional SQLite bindings: ${query.name}`,
         );
-        break;
       }
+
+      const tokens = sqlTokens(query.text);
+      const significant = tokens.filter(
+        (token) => !/^\s|^--|^\/\*/.test(token),
+      );
+      const aliases = new Map<string, string>();
+      for (let i = 0; i < significant.length - 1; i++) {
+        if (significant[i].toLowerCase() === "as") {
+          const token = significant[i + 1];
+          const alias = /^["'`\[]/.test(token)
+            ? token.slice(1, -1).replace(/(["'`])\1/g, "$1")
+            : token;
+          aliases.set(alias.toLowerCase(), alias);
+        }
+      }
+
+      const columns = query.columns.map((column) => ({
+        name: aliases.get(column.name.toLowerCase()) ?? column.name,
+        type: columnType(column),
+      }));
+      if (
+        new Set(columns.map((column) => column.name)).size !== columns.length
+      ) {
+        throw new Error(
+          `duplicate SQLite result names require SQL aliases: ${query.name}`,
+        );
+      }
+
+      if (columns.length) {
+        output += `export interface ${row} {\n${columns.map((column) => `${JSON.stringify(column.name)}: ${column.type};`).join("\n")}\n}\n\n`;
+      }
+
+      // better-sqlite3 treats ?N as named bindings. Give numbered slots explicit
+      // names, including repeated/out-of-order slots and intervening bare '?'.
+      const numbered = tokens.some((token) => /^\?\d+$/.test(token));
+      const objectBindings = named || numbered;
+      const usedKeys = new Set<string>();
+      const keys = params.map((param) => {
+        const base = named
+          ? param.column!.name
+          : numbered
+            ? `param${param.number}`
+            : param.column?.name || `arg${param.number}`;
+        let key = base;
+        if (!objectBindings) {
+          let suffix = 2;
+          while (usedKeys.has(key)) key = `${base}_${suffix++}`;
+        }
+
+        usedKeys.add(key);
+        return key;
+      });
+      if (new Set(keys).size !== keys.length) {
+        throw new Error(`duplicate SQLite argument names: ${query.name}`);
+      }
+
+      let maxSlot = 0;
+      const text = tokens
+        .map((token) => {
+          if (!/^\?\d*$/.test(token)) return token;
+          const slot = token.length > 1 ? Number(token.slice(1)) : maxSlot + 1;
+          maxSlot = Math.max(maxSlot, slot);
+          const index = params.findIndex((param) => param.number === slot);
+          if (index === -1) {
+            throw new Error(
+              `missing SQLite parameter metadata: ${query.name}.${slot}`,
+            );
+          }
+
+          return objectBindings ? `@${keys[index]}` : token;
+        })
+        .join("");
+      if (params.length && (objectBindings || emit === "functions")) {
+        output += `export interface ${args} {\n${keys.map((key, index) => `${JSON.stringify(key)}: ${paramTypes[index]};`).join("\n")}\n}\n\n`;
+      }
+
+      const bindings = objectBindings
+        ? `[${args}]`
+        : `[${paramTypes.join(", ")}]`;
+      const rowType = columns.length ? row : "unknown";
+      if (emit === "functions") {
+        output += `export const ${name}Query = ${JSON.stringify(text)};\n\n`;
+      }
+
+      const statement = `database.prepare<${bindings}${columns.length ? `, ${rowType}` : ""}>(${emit === "functions" ? `${name}Query` : JSON.stringify(text)})`;
+      if (emit === "prepared") {
+        const scalar = columns[0]?.type ?? "unknown";
+        const cast =
+          columns.length && scalar !== "unknown"
+            ? ` as unknown as PreparedStatement<${bindings}, ${rowType}, ${scalar}>`
+            : "";
+        output += `export function ${name}(database: Database.Database): PreparedStatement<${bindings}, ${rowType}, ${scalar}> {\nreturn ${statement}${cast};\n}\n\n`;
+        continue;
+      }
+
+      let resultType: string;
+      let call: string;
+      const values = objectBindings
+        ? "args"
+        : keys.map((key) => `args[${JSON.stringify(key)}]`).join(", ");
+      switch (query.cmd) {
+        case ":one":
+          resultType = `${rowType} | null`;
+          call = `stmt.get(${values}) ?? null`;
+          break;
+        case ":many":
+          resultType = `${rowType}[]`;
+          call = `stmt.all(${values})`;
+          break;
+        case ":execrows":
+          resultType = "number";
+          call = `stmt.run(${values}).changes`;
+          break;
+        case ":execlastid":
+          resultType = "number | bigint";
+          call = `stmt.run(${values}).lastInsertRowid`;
+          break;
+        default:
+          resultType = "void";
+          call = `stmt.run(${values})`;
+      }
+
+      output += `export function ${name}(database: Database.Database${params.length ? `, args: ${args}` : ""}): ${resultType} {\nconst stmt = ${statement};\n${query.cmd === ":exec" ? "" : "return "}${call};\n}\n\n`;
     }
 
-    if (column.notNull) {
-      return typ;
-    }
-
-    return factory.createUnionTypeNode([
-      typ,
-      factory.createLiteralTypeNode(factory.createNull()),
-    ]);
-  }
-
-  preamble(queries: Query[]) {
-    const imports: Node[] = [
-      factory.createImportDeclaration(
-        undefined,
-        factory.createImportClause(
-          false,
-          undefined,
-          factory.createNamedImports([
-            factory.createImportSpecifier(
-              false,
-              undefined,
-              factory.createIdentifier("Database")
-            ),
-          ])
-        ),
-        factory.createStringLiteral("better-sqlite3"),
-        undefined
-      ),
-    ];
-
-    return imports;
-  }
-
-  execDecl(
-    funcName: string,
-    queryName: string,
-    argIface: string | undefined,
-    params: Parameter[]
-  ) {
-    const funcParams = funcParamsDecl(argIface, params);
-
-    return factory.createFunctionDeclaration(
-      [
-        factory.createToken(SyntaxKind.ExportKeyword),
-        factory.createToken(SyntaxKind.AsyncKeyword),
-      ],
-      undefined,
-      factory.createIdentifier(funcName),
-      undefined,
-      funcParams,
-      factory.createTypeReferenceNode(factory.createIdentifier("Promise"), [
-        factory.createKeywordTypeNode(SyntaxKind.VoidKeyword),
-      ]),
-      factory.createBlock(
-        [
-          factory.createVariableStatement(
-            undefined,
-            factory.createVariableDeclarationList(
-              [
-                factory.createVariableDeclaration(
-                  factory.createIdentifier("stmt"),
-                  undefined,
-                  undefined,
-                  factory.createCallExpression(
-                    factory.createPropertyAccessExpression(
-                      factory.createIdentifier("database"),
-                      factory.createIdentifier("prepare")
-                    ),
-                    undefined,
-                    [factory.createIdentifier(queryName)]
-                  )
-                ),
-              ],
-              NodeFlags.Const |
-                // ts.NodeFlags.Constant |
-                // NodeFlags.AwaitContext |
-                // ts.NodeFlags.Constant |
-                // NodeFlags.ContextFlags |
-                NodeFlags.TypeExcludesFlags
-            )
-          ),
-          factory.createExpressionStatement(
-            factory.createAwaitExpression(
-              factory.createCallExpression(
-                factory.createPropertyAccessExpression(
-                  factory.createIdentifier("stmt"),
-                  factory.createIdentifier("run")
-                ),
-                undefined,
-                params.map((param, i) =>
-                  factory.createPropertyAccessExpression(
-                    factory.createIdentifier("args"),
-                    factory.createIdentifier(argName(i, param.column))
-                  )
-                )
-              )
-            )
-          ),
-        ],
-        true
-      )
+    const source = createSourceFile(
+      filename,
+      output,
+      ScriptTarget.Latest,
+      true,
+    );
+    const printer = createPrinter({ newLine: NewLineKind.LineFeed });
+    const formatted =
+      source.statements
+        .map((statement) =>
+          printer.printNode(EmitHint.Unspecified, statement, source),
+        )
+        .join("\n\n") + "\n";
+    files.push(
+      new File({
+        name: filename,
+        contents: new TextEncoder().encode(formatted),
+      }),
     );
   }
 
-  oneDecl(
-    funcName: string,
-    queryName: string,
-    argIface: string | undefined,
-    returnIface: string,
-    params: Parameter[],
-    columns: Column[]
-  ) {
-    const funcParams = funcParamsDecl(argIface, params);
-
-    return factory.createFunctionDeclaration(
-      [
-        factory.createToken(SyntaxKind.ExportKeyword),
-        factory.createToken(SyntaxKind.AsyncKeyword),
-      ],
-      undefined,
-      factory.createIdentifier(funcName),
-      undefined,
-      funcParams,
-      factory.createTypeReferenceNode(factory.createIdentifier("Promise"), [
-        factory.createUnionTypeNode([
-          factory.createTypeReferenceNode(
-            factory.createIdentifier(returnIface),
-            undefined
-          ),
-          factory.createLiteralTypeNode(factory.createNull()),
-        ]),
-      ]),
-      factory.createBlock(
-        [
-          factory.createVariableStatement(
-            undefined,
-            factory.createVariableDeclarationList(
-              [
-                factory.createVariableDeclaration(
-                  factory.createIdentifier("stmt"),
-                  undefined,
-                  undefined,
-                  factory.createCallExpression(
-                    factory.createPropertyAccessExpression(
-                      factory.createIdentifier("database"),
-                      factory.createIdentifier("prepare")
-                    ),
-                    undefined,
-                    [factory.createIdentifier(queryName)]
-                  )
-                ),
-              ],
-              NodeFlags.Const |
-                // ts.NodeFlags.Constant |
-                // NodeFlags.AwaitContext |
-                // ts.NodeFlags.Constant |
-                // NodeFlags.ContextFlags |
-                NodeFlags.TypeExcludesFlags
-            )
-          ),
-          factory.createVariableStatement(
-            undefined,
-            factory.createVariableDeclarationList(
-              [
-                factory.createVariableDeclaration(
-                  factory.createIdentifier("result"),
-                  undefined,
-                  undefined,
-                  factory.createAwaitExpression(
-                    factory.createCallExpression(
-                      factory.createPropertyAccessExpression(
-                        factory.createIdentifier("stmt"),
-                        factory.createIdentifier("get")
-                      ),
-                      undefined,
-                      params.map((param, i) =>
-                        factory.createPropertyAccessExpression(
-                          factory.createIdentifier("args"),
-                          factory.createIdentifier(argName(i, param.column))
-                        )
-                      )
-                    )
-                  )
-                ),
-              ],
-              NodeFlags.Const |
-                // ts.NodeFlags.Constant |
-                NodeFlags.AwaitContext |
-                // ts.NodeFlags.Constant |
-                NodeFlags.ContextFlags |
-                NodeFlags.TypeExcludesFlags
-            )
-          ),
-          factory.createIfStatement(
-            factory.createBinaryExpression(
-              factory.createIdentifier("result"),
-              factory.createToken(SyntaxKind.EqualsEqualsToken),
-              factory.createIdentifier("undefined")
-            ),
-            factory.createBlock(
-              [factory.createReturnStatement(factory.createNull())],
-              true
-            ),
-            undefined
-          ),
-          factory.createReturnStatement(
-            factory.createAsExpression(
-              factory.createIdentifier("result"),
-              factory.createTypeReferenceNode(
-                factory.createIdentifier(returnIface),
-                undefined
-              )
-            )
-          ),
-        ],
-        true
-      )
-    );
-  }
-
-  manyDecl(
-    funcName: string,
-    queryName: string,
-    argIface: string | undefined,
-    returnIface: string,
-    params: Parameter[],
-    columns: Column[]
-  ) {
-    const funcParams = funcParamsDecl(argIface, params);
-
-    return factory.createFunctionDeclaration(
-      [
-        factory.createToken(SyntaxKind.ExportKeyword),
-        factory.createToken(SyntaxKind.AsyncKeyword),
-      ],
-      undefined,
-      factory.createIdentifier(funcName),
-      undefined,
-      funcParams,
-      factory.createTypeReferenceNode(factory.createIdentifier("Promise"), [
-        factory.createArrayTypeNode(
-          factory.createTypeReferenceNode(
-            factory.createIdentifier(returnIface),
-            undefined
-          )
-        ),
-      ]),
-      factory.createBlock(
-        [
-          factory.createVariableStatement(
-            undefined,
-            factory.createVariableDeclarationList(
-              [
-                factory.createVariableDeclaration(
-                  factory.createIdentifier("stmt"),
-                  undefined,
-                  undefined,
-                  factory.createCallExpression(
-                    factory.createPropertyAccessExpression(
-                      factory.createIdentifier("database"),
-                      factory.createIdentifier("prepare")
-                    ),
-                    undefined,
-                    [factory.createIdentifier(queryName)]
-                  )
-                ),
-              ],
-              NodeFlags.Const |
-                // ts.NodeFlags.Constant |
-                // NodeFlags.AwaitContext |
-                // ts.NodeFlags.Constant |
-                // NodeFlags.ContextFlags |
-                NodeFlags.TypeExcludesFlags
-            )
-          ),
-          factory.createVariableStatement(
-            undefined,
-            factory.createVariableDeclarationList(
-              [
-                factory.createVariableDeclaration(
-                  factory.createIdentifier("result"),
-                  undefined,
-                  undefined,
-                  factory.createAwaitExpression(
-                    factory.createCallExpression(
-                      factory.createPropertyAccessExpression(
-                        factory.createIdentifier("stmt"),
-                        factory.createIdentifier("all")
-                      ),
-                      undefined,
-                      params.map((param, i) =>
-                        factory.createPropertyAccessExpression(
-                          factory.createIdentifier("args"),
-                          factory.createIdentifier(argName(i, param.column))
-                        )
-                      )
-                    )
-                  )
-                ),
-              ],
-              NodeFlags.Const |
-                // NodeFlags.Constant |
-                NodeFlags.AwaitContext |
-                // NodeFlags.Constant |
-                NodeFlags.ContextFlags |
-                NodeFlags.TypeExcludesFlags
-            )
-          ),
-          factory.createReturnStatement(
-            factory.createAsExpression(
-              factory.createIdentifier("result"),
-              factory.createArrayTypeNode(
-                factory.createTypeReferenceNode(
-                  factory.createIdentifier(returnIface),
-                  undefined
-                )
-              )
-            )
-          ),
-        ],
-        true
-      )
-    );
-  }
-
-  execlastidDecl(
-    funcName: string,
-    queryName: string,
-    argIface: string | undefined,
-    params: Parameter[]
-  ): FunctionDeclaration {
-    throw new Error(
-      "better-sqlite3 driver currently does not support :execlastid"
-    );
-  }
+  return new GenerateResponse({ files });
 }

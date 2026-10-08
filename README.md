@@ -3,6 +3,65 @@
 > [!CAUTION]
 > Here be dragons! This plugin is still in early access. Expect breaking changes, missing functionality, and sub-optimal output. Please report all issues and errors. Good luck!
 
+## Maintained SQLite fork
+
+This fork adds synchronous `better-sqlite3` generation for SQLite. Generated
+functions support `:exec`, `:execrows`, `:execlastid`, `:one`, and `:many`.
+`:one` returns `null` when no row exists. `:execlastid` returns `number | bigint`.
+Text, numeric, blob, nullable, and boolean storage types match the driver; unknown
+expressions and date affinities remain `unknown`. Integer row types assume the
+driver's default numeric mode. SQLite output now uses actual column names and
+alias casing, including quoted aliases, rather than camel-casing returned keys.
+
+Use the fork's checksum-pinned WASM release in sqlc's plugin configuration:
+
+```yaml
+plugins:
+  - name: ts
+    wasm:
+      url: https://github.com/kellen-miller/sqlc-gen-typescript/releases/download/v0.1.4-chief.1/sqlc-gen-typescript_0.1.4-chief.1.wasm
+      sha256: 685124bdee17518a6ee95dd9107a6d95c3be2990a465a1f1a1e9a37911240e57
+```
+
+Set `sqlite.emit: prepared` to receive typed statements instead of execution
+functions. This preserves synchronous transaction ownership and the driver's
+`get`, `all`, `run`, and scalar `pluck` APIs. Anonymous positional bindings use
+tuples. Named bindings use objects. Numbered positional bindings use objects
+with `param1`, `param2`, etc.; repeated slots share a value. Mixed named and
+positional bindings fail explicitly.
+
+```yaml
+options:
+  driver: better-sqlite3
+  sqlite:
+    emit: prepared # default: functions
+    filename: queries.ts # optional: combine input query files
+    parameter_types:
+      FindItems:
+        "1": number | null
+```
+
+`parameter_types` overrides inferred binding types by query name and SQL slot.
+Targets and types are validated; executable SQL is unchanged except bind-marker
+normalization. SQLite literals/comments are preserved during normalization.
+
+The plugin runs after sqlc parses and analyzes SQL. FTS5/sqlite-vec virtual-table
+analysis, recursive CTE analysis, and unsupported SQLite grammar require changes
+in sqlc itself. The generator cannot add those capabilities.
+
+Build with Node 24, sqlc 1.31.1, and Javy 1.2.0:
+
+```sh
+npm ci
+make test JAVY=/path/to/javy
+make generate JAVY=/path/to/javy
+```
+
+Tests generate through the actual WASM plugin, compile both APIs with strict
+TypeScript, and execute them against real SQLite. `out-node.cjs` additionally
+supports sqlc process plugins using the protobuf protocol via `node`.
+PostgreSQL and MySQL drivers retain their existing output.
+
 ## Usage
 
 ```yaml
