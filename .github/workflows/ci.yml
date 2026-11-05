@@ -1,11 +1,12 @@
-name: ci
+name: TypeScript generator
 on:
   push:
     branches:
       - main
   pull_request:
 jobs:
-  build:
+  build-generator:
+    name: TypeScript / Build and generated code validation
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4

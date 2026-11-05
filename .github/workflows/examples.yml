@@ -1,11 +1,13 @@
-name: examples
+name: TypeScript database examples
 on:
   push:
     branches:
       - main
   pull_request:
 jobs:
-  bun-mysql:
+  bun-mysql-tests:
+    name: >-
+      TypeScript / Example integration tests (Bun, MySQL, ${{ matrix.dir }})
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -32,7 +34,9 @@ jobs:
       env:
         DATABASE_URL: mysql://root:@localhost:3306/mysql
 
-  bun-postgresql:
+  bun-postgresql-tests:
+    name: >-
+      TypeScript / Example integration tests (Bun, PostgreSQL, ${{ matrix.dir }})
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -64,7 +68,9 @@ jobs:
       env:
         DATABASE_URL: ${{ steps.postgres.outputs.connection-uri }}?sslmode=disable
 
-  node-mysql:
+  node-mysql-tests:
+    name: >-
+      TypeScript / Example integration tests (Node.js, MySQL, ${{ matrix.dir }})
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -91,7 +97,9 @@ jobs:
       env:
         DATABASE_URL: mysql://root:@localhost:3306/mysql
 
-  node-postgresql:
+  node-postgresql-tests:
+    name: >-
+      TypeScript / Example integration tests (Node.js, PostgreSQL, ${{ matrix.dir }})
     runs-on: ubuntu-latest
     strategy:
       matrix:
